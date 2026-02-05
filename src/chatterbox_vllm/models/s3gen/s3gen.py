@@ -34,8 +34,13 @@ from .decoder import ConditionalDecoder
 
 
 def drop_invalid_tokens(x):
-    assert len(x.shape) <= 2 and x.shape[0] == 1, "only batch size of one allowed for now"
-    return x[x < SPEECH_VOCAB_SIZE]
+    # Support batching - process each sequence in the batch
+    if len(x.shape) == 2:
+        # Batch processing: filter each sequence independently
+        return [seq[seq < SPEECH_VOCAB_SIZE] for seq in x]
+    else:
+        # Single sequence
+        return x[x < SPEECH_VOCAB_SIZE]
 
 
 # TODO: global resampler cache
@@ -114,7 +119,8 @@ class S3Token2Mel(torch.nn.Module):
 
     @property
     def dtype(self):
-        params = self.tokenizer.parameters()
+        # Use flow's dtype since tokenizer/speaker_encoder stay in FP32
+        params = self.flow.parameters()
         return next(params).dtype
     
     def embed_ref(
@@ -161,6 +167,13 @@ class S3Token2Mel(torch.nn.Module):
             ref_speech_tokens = ref_speech_tokens[:, :ref_mels_24.shape[1] // 2]
             ref_speech_token_lens[0] = ref_speech_tokens.shape[1]
 
+        # Cast embeddings to match flow model dtype (FP16 if enabled)
+        flow_dtype = next(self.flow.parameters()).dtype
+        if ref_x_vector.dtype != flow_dtype:
+            ref_x_vector = ref_x_vector.to(flow_dtype)
+        if ref_mels_24.dtype != flow_dtype:
+            ref_mels_24 = ref_mels_24.to(flow_dtype)
+
         return dict(
             prompt_token=ref_speech_tokens.to(device),
             prompt_token_len=ref_speech_token_lens,
@@ -179,6 +192,7 @@ class S3Token2Mel(torch.nn.Module):
         ref_dict: Optional[dict] = None,
         finalize: bool = False,
         n_timesteps: int = 10,
+        speech_token_lens: Optional[torch.Tensor] = None,
     ):
         """
         Generate waveforms from S3 speech tokens and a reference waveform, which the speaker timbre is inferred from.
@@ -202,17 +216,26 @@ class S3Token2Mel(torch.nn.Module):
             ref_dict = self.embed_ref(ref_wav, ref_sr)
         else:
             # type/device casting (all values will be numpy if it's from a prod API call)
+            flow_dtype = next(self.flow.parameters()).dtype
             for rk in list(ref_dict):
                 if isinstance(ref_dict[rk], np.ndarray):
                     ref_dict[rk] = torch.from_numpy(ref_dict[rk])
                 if torch.is_tensor(ref_dict[rk]):
                     ref_dict[rk] = ref_dict[rk].to(self.device)
+                    # Cast float tensors to match flow dtype (FP16 if enabled)
+                    if ref_dict[rk].dtype in [torch.float32, torch.float64] and ref_dict[rk].dtype != flow_dtype:
+                        ref_dict[rk] = ref_dict[rk].to(flow_dtype)
 
         if len(speech_tokens.shape) == 1:
             speech_tokens = speech_tokens.unsqueeze(0)
 
-        # assert speech_tokens.shape[0] == 1, "only batch size of one allowed for now"
-        speech_token_lens = torch.LongTensor([speech_tokens.size(1)]).to(self.device)
+        # Handle batch sizes > 1 or explicit lengths
+        if speech_token_lens is None:
+             # Assume all sequences are full length if not provided
+             batch_size, seq_len = speech_tokens.shape
+             speech_token_lens = torch.full((batch_size,), seq_len, dtype=torch.long, device=self.device)
+        else:
+             speech_token_lens = speech_token_lens.to(self.device)
 
         output_mels, _ = self.flow.inference(
             token=speech_tokens,
@@ -258,9 +281,10 @@ class S3Token2Wav(S3Token2Mel):
         ref_sr: Optional[int],
         # pre-computed ref embedding (prod API)
         ref_dict: Optional[dict] = None,
-        finalize: bool = False
+        finalize: bool = False,
+        speech_token_lens: Optional[torch.Tensor] = None,
     ):
-        output_mels = super().forward(speech_tokens, ref_wav=ref_wav, ref_sr=ref_sr, ref_dict=ref_dict, finalize=finalize)
+        output_mels = super().forward(speech_tokens, ref_wav=ref_wav, ref_sr=ref_sr, ref_dict=ref_dict, finalize=finalize, speech_token_lens=speech_token_lens)
 
         # TODO jrm: ignoring the speed control (mel interpolation) and the HiFTGAN caching mechanisms for now.
         hift_cache_source = torch.zeros(1, 1, 0).to(self.device)
@@ -284,13 +308,21 @@ class S3Token2Wav(S3Token2Mel):
         ref_dict: Optional[dict] = None,
         finalize: bool = False,
         n_timesteps: int = 10,
+        speech_token_lens: Optional[torch.Tensor] = None,
     ):
-        return super().forward(speech_tokens, ref_wav=ref_wav, ref_sr=ref_sr, ref_dict=ref_dict, finalize=finalize, n_timesteps=n_timesteps)
+        return super().forward(speech_tokens, ref_wav=ref_wav, ref_sr=ref_sr, ref_dict=ref_dict, finalize=finalize, n_timesteps=n_timesteps, speech_token_lens=speech_token_lens)
 
     @torch.inference_mode()
     def hift_inference(self, speech_feat, cache_source: torch.Tensor = None):
+        # Ensure inputs match model dtype (FP16 if enabled)
+        if speech_feat.dtype != self.dtype:
+            speech_feat = speech_feat.to(self.dtype)
+
         if cache_source is None:
-            cache_source = torch.zeros(1, 1, 0).to(self.device)
+            cache_source = torch.zeros(1, 1, 0).to(self.device, dtype=self.dtype)
+        elif cache_source.dtype != self.dtype:
+            cache_source = cache_source.to(self.dtype)
+
         return self.mel2wav.inference(speech_feat=speech_feat, cache_source=cache_source)
 
     @torch.inference_mode()
@@ -306,8 +338,9 @@ class S3Token2Wav(S3Token2Mel):
         finalize: bool = True,
         no_trim: bool = False,
         n_timesteps: int = 10,
+        speech_token_lens: Optional[torch.Tensor] = None,
     ):
-        output_mels = self.flow_inference(speech_tokens, ref_wav=ref_wav, ref_sr=ref_sr, ref_dict=ref_dict, finalize=finalize, n_timesteps=n_timesteps)
+        output_mels = self.flow_inference(speech_tokens, ref_wav=ref_wav, ref_sr=ref_sr, ref_dict=ref_dict, finalize=finalize, n_timesteps=n_timesteps, speech_token_lens=speech_token_lens)
         output_wavs, output_sources = self.hift_inference(output_mels, cache_source)
 
         # NOTE: ad-hoc method to reduce "spillover" from the reference clip.
